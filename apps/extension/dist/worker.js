@@ -19750,7 +19750,12 @@ var settingsSchema = external_exports.object({
     }
   }, "\u041D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u044B\u0439 \u0447\u0430\u0441\u043E\u0432\u043E\u0439 \u043F\u043E\u044F\u0441"),
   shareHistory: external_exports.boolean(),
-  weeklyGoal: external_exports.number().int().min(0).max(100).optional()
+  weeklyGoal: external_exports.number().int().min(0).max(100).optional(),
+  siteLimits: external_exports.array(external_exports.object({ domain: domain2, limitMs: external_exports.number().int().min(0).max(864e5) })).max(100).refine(
+    (r) => new Set(r.map((v) => v.domain)).size === r.length,
+    "\u0423\u0431\u0435\u0440\u0438\u0442\u0435 \u043F\u043E\u0432\u0442\u043E\u0440\u044F\u044E\u0449\u0438\u0435\u0441\u044F \u0434\u043E\u043C\u0435\u043D\u044B"
+  ).optional(),
+  allowExtraTime: external_exports.boolean().optional()
 });
 var defaults = {
   domains: ["youtube.com", "instagram.com", "tiktok.com"],
@@ -19777,7 +19782,14 @@ var decisionSchema = external_exports.object({
   domain: domain2.optional(),
   at: external_exports.number().int().nonnegative(),
   kind: external_exports.enum(["budget", "context"]),
-  action: external_exports.enum(["return", "allow5", "allow-session", "details"]),
+  action: external_exports.enum([
+    "return",
+    "allow5",
+    "allow-session",
+    "details",
+    "focus-delay",
+    "chat-pass"
+  ]),
   expiresAt: external_exports.number().int().nonnegative().optional()
 });
 var sessionSchema = external_exports.object({
@@ -19797,7 +19809,13 @@ var sessionSchema = external_exports.object({
   rules: settingsSchema,
   intervals: external_exports.array(intervalSchema).max(2e4),
   exceptions: external_exports.array(exceptionSchema).max(200),
-  warnings: external_exports.array(external_exports.object({ at: external_exports.number().int(), kind: external_exports.literal("budget") })).max(1)
+  warnings: external_exports.array(
+    external_exports.object({
+      at: external_exports.number().int(),
+      kind: external_exports.enum(["budget", "site-limit"]),
+      domain: domain2.optional()
+    })
+  ).max(201)
 }).superRefine((s, ctx) => {
   const issue2 = (message) => ctx.addIssue({ code: "custom", message });
   if (s.endedAt < s.startedAt || s.elapsedMs > s.plannedMs || s.elapsedMs > s.endedAt - s.startedAt)
@@ -19808,7 +19826,7 @@ var sessionSchema = external_exports.object({
       issue2("\u041F\u0435\u0440\u0435\u0441\u0435\u043A\u0430\u044E\u0449\u0438\u0435\u0441\u044F \u0438\u043B\u0438 \u043D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0435 \u0438\u043D\u0442\u0435\u0440\u0432\u0430\u043B\u044B");
     last = i.end;
     total += i.end - i.start;
-    const expected = s.rules.domains.some((d) => matches(i.domain, d)) && !s.exceptions.some((e) => exceptionApplies(e, i.domain, i.start));
+    const expected = isDistracting(s.rules, i.domain) && !s.exceptions.some((e) => exceptionApplies(e, i.domain, i.start));
     if (i.distracting !== expected || s.exceptions.some(
       (e) => matches(i.domain, e.domain) && (e.at > i.start && e.at < i.end || e.expiresAt !== void 0 && e.expiresAt > i.start && e.expiresAt < i.end)
     ))
@@ -19850,6 +19868,15 @@ function totals(s) {
     distractedMs,
     overBudgetMs: Math.max(0, distractedMs - s.rules.budgetMs)
   };
+}
+function dayKey(t, tz) {
+  const p = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(t);
+  return ["year", "month", "day"].map((k) => p.find((x) => x.type === k).value).join("-");
 }
 function countVisits(visits, from, to) {
   return visits.filter(
@@ -19905,7 +19932,7 @@ function settle2(a, now) {
       for (let n = 0; n < boundaries.length - 1; n++) {
         const start = boundaries[n], stop = boundaries[n + 1];
         if (stop <= start) continue;
-        const distracting = a.session.rules.domains.some((d) => matches(a.host, d)) && !a.session.exceptions.some(
+        const distracting = isDistracting(a.session.rules, a.host) && !a.session.exceptions.some(
           (e) => exceptionApplies(e, a.host, start)
         );
         const last = a.session.intervals.at(-1);
@@ -19926,8 +19953,18 @@ function settle2(a, now) {
   a.cursor = end;
   a.lastCheckpoint = now;
   a.session.endedAt = end;
-  if (!a.session.warnings.length && totals(a.session).distractedMs >= a.session.rules.budgetMs)
+  if (!a.session.warnings.some((w) => w.kind === "budget") && totals(a.session).distractedMs >= a.session.rules.budgetMs)
     a.session.warnings.push({ kind: "budget", at: end });
+  for (const rule of a.session.rules.siteLimits ?? []) {
+    if (rule.limitMs > 0 && siteUsage(a.session, rule.domain) >= rule.limitMs && !a.session.warnings.some(
+      (w) => w.kind === "site-limit" && w.domain === rule.domain
+    ))
+      a.session.warnings.push({
+        at: end,
+        kind: "site-limit",
+        domain: rule.domain
+      });
+  }
   return a;
 }
 function pause(a, now) {
@@ -19977,9 +20014,47 @@ function decide(a, action, host, now) {
     ...expiresAt !== void 0 ? { expiresAt } : {}
   });
 }
+var DAILY_PLAN_MS = 4 * 60 * 6e4;
+function isDistracting(settings, host) {
+  return [
+    ...settings.domains,
+    ...(settings.siteLimits ?? []).map((r) => r.domain)
+  ].some((d) => matches(host, d));
+}
+var FOCUS_DELAY_MS = 15e3;
+var CHAT_PASS_MS = 10 * 6e4;
+function siteLimit(settings, host) {
+  return settings.siteLimits?.filter((r) => matches(host, r.domain)).sort((a, b) => b.domain.length - a.domain.length)[0];
+}
+function siteUsage(s, host) {
+  return s.intervals.filter((i) => matches(i.domain, host)).reduce((n, i) => n + i.end - i.start, 0);
+}
+function chatPath(host) {
+  if (matches(host, "instagram.com")) return "/direct/";
+  if (matches(host, "facebook.com")) return "/messages/";
+  return null;
+}
+function blockedDomains(settings, session, now) {
+  const rules = session?.rules ?? settings;
+  const blocked2 = /* @__PURE__ */ new Set();
+  for (const r of rules.siteLimits ?? [])
+    if (r.limitMs === 0 || session && siteUsage(session, r.domain) >= r.limitMs)
+      blocked2.add(r.domain);
+  if (session && totals(session).distractedMs >= rules.budgetMs)
+    for (const d of [
+      ...rules.domains,
+      ...(rules.siteLimits ?? []).map((r) => r.domain)
+    ])
+      blocked2.add(d);
+  return [...blocked2].filter(
+    (d) => siteLimit(rules, d)?.limitMs === 0 || !session?.exceptions.some((e) => exceptionApplies(e, d, now))
+  );
+}
 
 // apps/extension/src/worker.ts
 var store;
+var nextLimitTimer;
+var appliedRules = "";
 var chain = Promise.resolve();
 var serial = (fn) => {
   const p = chain.then(fn);
@@ -19991,6 +20066,7 @@ var serial = (fn) => {
   return p;
 };
 var persist = async () => {
+  await enforceRules();
   await chrome.storage.local.set({ nazar: store });
   if (chrome.action) {
     const a = store.active;
@@ -20002,6 +20078,79 @@ var persist = async () => {
     });
   }
 };
+function blocked() {
+  return blockedDomains(
+    store.settings,
+    store.active?.session ?? store.restrictionSession ?? null,
+    Date.now()
+  );
+}
+function blockUrl(domain3) {
+  return "http://localhost:5173/#blocked?domain=" + encodeURIComponent(domain3) + "&extension=" + chrome.runtime.id;
+}
+async function enforceRules() {
+  if (!chrome.declarativeNetRequest) return;
+  const now = Date.now();
+  if (store.chatPass && store.chatPass.expiresAt <= now) store.chatPass = null;
+  const domains = blocked();
+  const protectedHosts = [
+    new URL("http://localhost:5173").hostname,
+    new URL("http://localhost:3001").hostname
+  ];
+  const rules = domains.map(
+    (domain3, n) => ({
+      id: n + 1,
+      priority: 1,
+      action: {
+        type: chrome.declarativeNetRequest.RuleActionType.REDIRECT,
+        redirect: { url: blockUrl(domain3) }
+      },
+      condition: {
+        requestDomains: [domain3],
+        excludedRequestDomains: protectedHosts,
+        resourceTypes: [chrome.declarativeNetRequest.ResourceType.MAIN_FRAME]
+      }
+    })
+  );
+  const pass = store.chatPass;
+  if (pass && chatPath(pass.domain)) {
+    rules.push({
+      id: 10001,
+      priority: 2,
+      action: { type: chrome.declarativeNetRequest.RuleActionType.ALLOW },
+      condition: {
+        regexFilter: "^https://([a-z0-9-]+\\.)*" + pass.domain.replaceAll(".", "\\.") + chatPath(pass.domain),
+        resourceTypes: [chrome.declarativeNetRequest.ResourceType.MAIN_FRAME]
+      }
+    });
+    await chrome.alarms.create("chat-expiry", { when: pass.expiresAt });
+  }
+  const signature = JSON.stringify(rules);
+  if (signature !== appliedRules) {
+    const old = await chrome.declarativeNetRequest.getDynamicRules();
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: old.map((r) => r.id),
+      addRules: rules
+    });
+    appliedRules = signature;
+  }
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    if (tab.id === void 0 || !tab.url || !/^https?:/.test(tab.url)) continue;
+    const host = domainOf(tab.url);
+    if (host && protectedHosts.some((p) => host === p || host.endsWith("." + p)))
+      continue;
+    const domain3 = domains.find(
+      (d) => host && (host === d || host.endsWith("." + d))
+    );
+    if (!domain3) continue;
+    const url2 = new URL(tab.url);
+    if (pass?.domain === domain3 && pass.expiresAt > now && url2.protocol === "https:" && url2.pathname.startsWith(chatPath(domain3) ?? "\0"))
+      continue;
+    await chrome.tabs.update(tab.id, { url: blockUrl(domain3) }).catch(() => {
+    });
+  }
+}
 async function request(path, method = "GET", body, anonymous = false) {
   const res = await fetch("http://localhost:3001" + path, {
     method,
@@ -20061,10 +20210,12 @@ async function sync(force = false) {
 }
 async function finish(interrupted = false, done = false) {
   if (!store.active) return;
+  if (nextLimitTimer) clearTimeout(nextLimitTimer);
   const a = store.active;
   a.session.status = interrupted ? "interrupted" : "completed";
   a.session.taskDone = done;
   store.lastResult = structuredClone(a.session);
+  store.restrictionSession = interrupted ? structuredClone(a.session) : null;
   if (store.auth)
     store.queue.push({
       ownerId: store.auth.ownerId,
@@ -20074,6 +20225,8 @@ async function finish(interrupted = false, done = false) {
       nextAt: 0
     });
   store.active = null;
+  store.focus = {};
+  store.chatPass = null;
   store.syncStatus = "\u041E\u0436\u0438\u0434\u0430\u0435\u0442 \u043E\u0442\u043F\u0440\u0430\u0432\u043A\u0438";
   await persist();
 }
@@ -20120,6 +20273,19 @@ async function checkpoint(now = Date.now(), override) {
     return;
   }
   a.host = a.pausedAt !== null || override === null ? null : await observeHost();
+  if (nextLimitTimer) clearTimeout(nextLimitTimer);
+  if (a.host && a.pausedAt === null) {
+    const rule = siteLimit(a.session.rules, a.host);
+    const remaining = rule ? rule.limitMs - siteUsage(a.session, rule.domain) : Number.POSITIVE_INFINITY;
+    const budget = a.session.rules.domains.some(
+      (d) => a.host === d || a.host.endsWith("." + d)
+    ) ? a.session.rules.budgetMs - totals(a.session).distractedMs : Number.POSITIVE_INFINITY;
+    const delay = Math.min(remaining, budget, a.deadline - now);
+    if (Number.isFinite(delay) && delay > 0) {
+      nextLimitTimer = setTimeout(() => event(), delay);
+      if (typeof nextLimitTimer === "object") nextLimitTimer.unref();
+    }
+  }
   await persist();
 }
 async function init() {
@@ -20144,6 +20310,8 @@ async function init() {
     store.active.session.interruption = "worker-restart";
     await finish(true);
   }
+  store.focus ??= {};
+  store.chatPass = null;
   await persist();
   chrome.idle.setDetectionInterval(120);
   await chrome.alarms.create("checkpoint", { periodInMinutes: 0.5 });
@@ -20218,6 +20386,21 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (sender.id !== chrome.runtime.id) return false;
   void serial(async () => {
     await ready;
+    if (sender.tab) {
+      let trusted = false;
+      try {
+        trusted = new URL(sender.url ?? "").origin === new URL("http://localhost:5173").origin;
+      } catch {
+      }
+      if (!trusted || !["state", "start", "pause", "resume", "finish", "sync"].includes(
+        msg.type
+      ))
+        throw Error("\u041D\u0435\u0434\u043E\u043F\u0443\u0441\u0442\u0438\u043C\u0430\u044F \u043A\u043E\u043C\u0430\u043D\u0434\u0430 \u0441\u0430\u0439\u0442\u0430");
+      if (msg.webOwnerId !== store.auth?.ownerId)
+        throw Error(
+          "\u0420\u0430\u0441\u0448\u0438\u0440\u0435\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u043A \u0434\u0440\u0443\u0433\u043E\u043C\u0443 \u0430\u043A\u043A\u0430\u0443\u043D\u0442\u0443. \u041F\u0435\u0440\u0435\u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0438\u0442\u0435 \u0435\u0433\u043E \u0432 \u0440\u0430\u0437\u0434\u0435\u043B\u0435 \xAB\u0420\u0430\u0441\u0448\u0438\u0440\u0435\u043D\u0438\u0435\xBB."
+        );
+    }
     await checkpoint();
     switch (msg.type) {
       case "state":
@@ -20233,6 +20416,10 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         store.history = null;
         store.historyOwner = null;
         store.lastResult = null;
+        store.restrictionSession = null;
+        store.pendingPlan = void 0;
+        store.focus = {};
+        store.chatPass = null;
         await persist();
         await sync(true);
         break;
@@ -20246,6 +20433,10 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         store.auth = null;
         store.history = null;
         store.lastResult = null;
+        store.restrictionSession = null;
+        store.pendingPlan = void 0;
+        store.focus = {};
+        store.chatPass = null;
         store.settings = structuredClone(defaults);
         store.syncStatus = "\u041D\u0443\u0436\u0435\u043D \u0432\u0445\u043E\u0434";
         await persist();
@@ -20260,21 +20451,37 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         const minutes = Number(msg.minutes);
         if (!goal || goal.length > 200 || !Number.isFinite(minutes) || minutes < 1 / 60 || minutes > 240)
           throw Error("\u0423\u043A\u0430\u0436\u0438\u0442\u0435 \u0446\u0435\u043B\u044C \u0438 \u0434\u043B\u0438\u0442\u0435\u043B\u044C\u043D\u043E\u0441\u0442\u044C \u043E\u0442 1 \u0441\u0435\u043A\u0443\u043D\u0434\u044B \u0434\u043E 240 \u043C\u0438\u043D\u0443\u0442");
+        const plannedMs = Math.round(minutes * 6e4);
+        const pending = store.pendingPlan;
+        const day = dayKey(Date.now(), "Asia/Qyzylorda");
+        const id = pending?.goal === goal && pending.plannedMs === plannedMs && pending.day === day ? pending.id : crypto.randomUUID();
+        store.pendingPlan = { id, goal, plannedMs, day };
+        await persist();
+        await request("/api/plans", "POST", {
+          id,
+          goal,
+          plannedMs,
+          source: "extension"
+        });
         store.active = createActive(
-          crypto.randomUUID(),
+          id,
           store.instanceId,
           goal,
           Math.round(minutes * 6e4),
           store.settings,
           Date.now()
         );
+        store.restrictionSession = null;
+        store.pendingPlan = void 0;
+        store.focus = {};
+        store.chatPass = null;
         store.active.host = await observeHost();
         const tabs = await chrome.tabs.query({
           active: true,
           lastFocusedWindow: true
         });
         store.active.taskTabId = tabs[0]?.id;
-        await persist();
+        await checkpoint();
         break;
       }
       case "pause":
@@ -20292,6 +20499,10 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         break;
       case "except":
         if (store.active?.host) {
+          if (blocked().some(
+            (d) => store.active.host === d || store.active.host.endsWith("." + d)
+          ))
+            throw Error("\u0418\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0439\u0442\u0435 Focus Delay \u043D\u0430 \u0441\u0442\u0440\u0430\u043D\u0438\u0446\u0435 \u043E\u0433\u0440\u0430\u043D\u0438\u0447\u0435\u043D\u0438\u044F");
           except(store.active, store.active.host, Date.now());
           await persist();
         }
@@ -20299,6 +20510,12 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       case "decision": {
         if (!store.active) throw Error("\u041D\u0435\u0442 \u0430\u043A\u0442\u0438\u0432\u043D\u043E\u0439 \u0441\u0435\u0441\u0441\u0438\u0438");
         const action = decisionSchema.shape.action.parse(msg.action);
+        if (action === "chat-pass" || action === "focus-delay")
+          throw Error("\u041E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0441\u0442\u0440\u0430\u043D\u0438\u0446\u0443 \u043E\u0433\u0440\u0430\u043D\u0438\u0447\u0435\u043D\u0438\u044F Nazar");
+        if ((action === "allow5" || action === "allow-session") && (store.active.session.rules.allowExtraTime !== true || blocked().length))
+          throw Error(
+            "\u0414\u043E\u043F\u043E\u043B\u043D\u0438\u0442\u0435\u043B\u044C\u043D\u043E\u0435 \u0432\u0440\u0435\u043C\u044F \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u043E \u0447\u0435\u0440\u0435\u0437 Focus Delay, \u0435\u0441\u043B\u0438 \u0440\u0430\u0437\u0440\u0435\u0448\u0435\u043D\u043E \u0432 \u043F\u0440\u0430\u0432\u0438\u043B\u0430\u0445"
+          );
         if ((action === "allow5" || action === "allow-session") && !store.active.host)
           throw Error("\u041E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u043D\u0443\u0436\u043D\u044B\u0439 \u0441\u0430\u0439\u0442 \u0432 \u0441\u0444\u043E\u043A\u0443\u0441\u0438\u0440\u043E\u0432\u0430\u043D\u043D\u043E\u043C Chrome");
         decide(store.active, action, store.active.host, Date.now());
@@ -20327,6 +20544,12 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       case "sync":
         await sync(true);
         break;
+      case "openBlocked": {
+        const domain3 = blocked()[0];
+        if (!domain3) throw Error("\u0410\u043A\u0442\u0438\u0432\u043D\u044B\u0445 \u043E\u0433\u0440\u0430\u043D\u0438\u0447\u0435\u043D\u0438\u0439 \u043D\u0435\u0442");
+        await chrome.tabs.create({ url: blockUrl(domain3) });
+        break;
+      }
       case "history":
         await importHistory();
         break;
@@ -20376,6 +20599,82 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       lastResult: store.lastResult,
       currentHost: await observeHost(),
       totals: store.active ? totals(store.active.session) : null
+    };
+  }).then(
+    (state) => respond({ ok: true, state }),
+    (e) => respond({ ok: false, error: e.message })
+  );
+  return true;
+});
+chrome.runtime.onMessageExternal?.addListener((msg, sender, respond) => {
+  let trusted = false;
+  try {
+    trusted = new URL(sender.url ?? "").origin === new URL("http://localhost:5173").origin;
+  } catch {
+  }
+  if (!trusted) return false;
+  void serial(async () => {
+    await ready;
+    await checkpoint();
+    const domain3 = domainOf(String(msg.domain ?? ""));
+    if (!domain3 || !blocked().includes(domain3))
+      throw Error("\u041E\u0433\u0440\u0430\u043D\u0438\u0447\u0435\u043D\u0438\u0435 \u0431\u043E\u043B\u044C\u0448\u0435 \u043D\u0435 \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442. \u0412\u0435\u0440\u043D\u0438\u0442\u0435\u0441\u044C \u043A \u0437\u0430\u0434\u0430\u0447\u0435.");
+    const a = store.active;
+    const rules = a?.session.rules ?? store.settings;
+    const hard = siteLimit(rules, domain3)?.limitMs === 0;
+    const now = Date.now();
+    store.focus ??= {};
+    if (msg.type === "focus") {
+      if (!store.focus[domain3]) {
+        store.focus[domain3] = now + FOCUS_DELAY_MS;
+        if (a) decide(a, "focus-delay", domain3, now);
+      }
+    } else if (msg.type === "chat" || msg.type === "extra" || msg.type === "return") {
+      if (!store.focus[domain3] || now < store.focus[domain3])
+        throw Error("\u0414\u043E\u0436\u0434\u0438\u0442\u0435\u0441\u044C \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043D\u0438\u044F 15-\u0441\u0435\u043A\u0443\u043D\u0434\u043D\u043E\u0439 \u043F\u0430\u0443\u0437\u044B");
+      if (!a || a.pausedAt !== null)
+        throw Error("\u041D\u0430\u0447\u043D\u0438\u0442\u0435 \u0438\u043B\u0438 \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0438\u0442\u0435 \u0443\u0447\u0435\u0431\u043D\u0443\u044E \u0441\u0435\u0441\u0441\u0438\u044E \u0432 \u0440\u0430\u0441\u0448\u0438\u0440\u0435\u043D\u0438\u0438");
+      if (msg.type === "chat") {
+        if (hard || !chatPath(domain3))
+          throw Error("\u0414\u043B\u044F \u044D\u0442\u043E\u0433\u043E \u0441\u0430\u0439\u0442\u0430 Chat Pass \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D");
+        if (a.session.decisions?.some(
+          (d) => d.action === "chat-pass" && d.domain === domain3
+        ))
+          throw Error("Chat Pass \u0443\u0436\u0435 \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u043D \u0434\u043B\u044F \u044D\u0442\u043E\u0433\u043E \u0441\u0430\u0439\u0442\u0430 \u0432 \u0441\u0435\u0441\u0441\u0438\u0438");
+        const expiresAt = Math.min(a.deadline, now + CHAT_PASS_MS);
+        store.chatPass = { domain: domain3, expiresAt };
+        (a.session.decisions ??= []).push({
+          domain: domain3,
+          at: now,
+          kind: "budget",
+          action: "chat-pass",
+          expiresAt
+        });
+        await persist();
+        return { navigate: "https://" + domain3 + chatPath(domain3) };
+      }
+      if (msg.type === "extra") {
+        if (hard || rules.allowExtraTime !== true)
+          throw Error("\u0414\u043E\u043F\u043E\u043B\u043D\u0438\u0442\u0435\u043B\u044C\u043D\u043E\u0435 \u0432\u0440\u0435\u043C\u044F \u043E\u0442\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u0432 \u043F\u0440\u0430\u0432\u0438\u043B\u0430\u0445");
+        decide(a, "allow5", domain3, now);
+        await persist();
+        return { navigate: "https://" + domain3 + "/" };
+      }
+      decide(a, "return", domain3, now);
+      if (a.taskTabId !== void 0)
+        await chrome.tabs.update(a.taskTabId, { active: true }).catch(() => {
+        });
+    } else if (msg.type !== "blocked-state") throw Error("\u041D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u043A\u043E\u043C\u0430\u043D\u0434\u0430");
+    await persist();
+    return {
+      domain: domain3,
+      goal: a?.session.goal ?? "\u0412\u0435\u0440\u043D\u0438\u0442\u0435\u0441\u044C \u043A \u0437\u0430\u043F\u043B\u0430\u043D\u0438\u0440\u043E\u0432\u0430\u043D\u043D\u043E\u0439 \u0437\u0430\u0434\u0430\u0447\u0435",
+      readyAt: store.focus[domain3] ?? null,
+      canChat: !!a && !hard && !!chatPath(domain3) && !a.session.decisions?.some(
+        (d) => d.action === "chat-pass" && d.domain === domain3
+      ),
+      canExtra: !!a && !hard && rules.allowExtraTime === true,
+      hard
     };
   }).then(
     (state) => respond({ ok: true, state }),

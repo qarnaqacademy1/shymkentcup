@@ -10,6 +10,14 @@ import {
 import "./style.css";
 import "./product.css";
 import {
+  Analytics,
+  DailyReport,
+  Assistant,
+  SiteLimitsEditor,
+  BlockedPage,
+  Donut,
+} from "./nazar4";
+import {
   AttentionMap,
   MobileTimer,
   InstallPwa,
@@ -74,7 +82,10 @@ const date = (t: number, tz = "Asia/Almaty") =>
   }).format(t);
 const labels: Record<string, string> = {
   overview: "Обзор",
-  timer: "Таймер",
+  timer: "Smart Start",
+  analytics: "Аналитика",
+  report: "Отчёт за день",
+  ai: "Nazar AI",
   sessions: "Мои сессии",
   settings: "Мои правила",
   install: "Расширение",
@@ -82,6 +93,28 @@ const labels: Record<string, string> = {
 };
 function Icon({ name }: { name: string }) {
   const paths: Record<string, React.ReactNode> = {
+    timer: (
+      <>
+        <circle cx="12" cy="13" r="8" />
+        <path d="M12 9v4l3 2M9 2h6" />
+      </>
+    ),
+    analytics: (
+      <>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 3v9h9" />
+      </>
+    ),
+    report: (
+      <>
+        <path d="M6 3h9l3 3v15H6ZM9 9h6M9 13h6M9 17h4" />
+      </>
+    ),
+    ai: (
+      <>
+        <path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z" />
+      </>
+    ),
     overview: (
       <>
         <rect x="3" y="3" width="7" height="7" rx="2" />
@@ -149,7 +182,7 @@ function Brand() {
 function App() {
   const [user, setUser] = useState<User | null>(null),
     [loading, setLoading] = useState(true),
-    [page, setPage] = useState(location.hash.slice(1) || "overview"),
+    [page, setPage] = useState(location.hash.slice(1) || "timer"),
     [error, setError] = useState(""),
     [notice, setNotice] = useState(""),
     [stats, setStats] = useState<Stats | null>(null),
@@ -167,7 +200,7 @@ function App() {
   const [period, setPeriod] = useState(30);
   useEffect(() => {
     const h = () => {
-      setPage(location.hash.slice(1) || "overview");
+      setPage(location.hash.slice(1) || "timer");
       setDetail(null);
       setError("");
     };
@@ -348,7 +381,7 @@ function App() {
               [
                 "02",
                 "Заметь переключение",
-                "Расширение напомнит о бюджете. Нужен YouTube для лекции? Разреши его для текущей задачи.",
+                "Расширение ограничит выбранные сайты. После лимита сделай осознанную паузу и вернись к цели.",
               ],
               [
                 "03",
@@ -421,7 +454,7 @@ function App() {
                       }),
                     );
                     setAuthMode(null);
-                    navigate("overview");
+                    navigate("timer");
                   });
                 }}
               >
@@ -681,73 +714,7 @@ function App() {
                 }}
               />
               <div className="overview-grid">
-                <section className="panel">
-                  <div className="section-heading">
-                    <h2>Время по дням</h2>
-                    <small>минуты</small>
-                  </div>
-                  {stats && Object.keys(stats.days).length > 0 ? (
-                    <>
-                      <div className="chart">
-                        {Object.entries(stats.days)
-                          .sort(([a], [b]) => a.localeCompare(b))
-                          .slice(-14)
-                          .map(([day, v]) => (
-                            <div className="chart-column" key={day}>
-                              <span>
-                                {Math.round((v.trackedMs / 60000) * 10) / 10}
-                              </span>
-                              <div
-                                className="chart-bar"
-                                style={{
-                                  height: Math.max(
-                                    3,
-                                    (v.trackedMs /
-                                      Math.max(
-                                        ...Object.values(stats.days).map(
-                                          (d) => d.trackedMs,
-                                        ),
-                                      )) *
-                                      120,
-                                  ),
-                                }}
-                              >
-                                <div
-                                  style={{
-                                    height: v.trackedMs
-                                      ? (v.distractedMs / v.trackedMs) * 100 +
-                                        "%"
-                                      : "0%",
-                                  }}
-                                />
-                              </div>
-                              <small>
-                                {day.slice(8)}.{day.slice(5, 7)}
-                              </small>
-                            </div>
-                          ))}
-                      </div>
-                      <div className="legend">
-                        <span className="dot" /> Другие сайты{" "}
-                        <span className="dot sand" /> Отвлекающие
-                      </div>
-                    </>
-                  ) : (
-                    <div className="empty-chart">
-                      <span className="empty-lines" />
-                      <Icon name="sessions" />
-                      <h3>Здесь появится твой ритм</h3>
-                      <p>
-                        После первой Chrome-сессии покажем учтённое время по
-                        дням.
-                      </p>
-                    </div>
-                  )}
-                  <p className="footnote">
-                    Время сайтов — наблюдение за активной вкладкой, а не оценка
-                    концентрации.
-                  </p>
-                </section>
+                <Analytics api={api} settings={settings} />
                 <section className="panel rules-summary">
                   <p className="eyebrow">ТВОИ ГРАНИЦЫ</p>
                   <h2>Правила задаёшь ты.</h2>
@@ -857,6 +824,13 @@ function App() {
                       timezone: f.get("timezone"),
                       shareHistory: f.get("share") === "on",
                       weeklyGoal: Number(f.get("weeklyGoal")),
+                      siteLimits: JSON.parse(
+                        String(f.get("siteLimits") || "[]"),
+                      ).map((r: any) => ({
+                        ...r,
+                        domain: domainOf(r.domain) ?? r.domain,
+                      })),
+                      allowExtraTime: f.get("allowExtraTime") === "on",
                     });
                     setSettings(v);
                     setNotice(
@@ -939,6 +913,7 @@ function App() {
                     Отключение удалит серверную сводку.
                   </p>
                 </div>
+                <SiteLimitsEditor settings={settings} />
                 <button disabled={busy}>
                   {busy ? "Сохраняем…" : "Сохранить мои правила →"}
                 </button>
@@ -957,8 +932,15 @@ function App() {
                 })
               }
               onSaved={() => void run(load)}
+              reserve={(plan) =>
+                api("/plans", "POST", { ...plan, source: "mobile" })
+              }
+              getBudget={() => api("/plans")}
             />
           )}
+          {page === "analytics" && <Analytics api={api} settings={settings} />}
+          {page === "report" && <DailyReport api={api} settings={settings} />}
+          {page === "ai" && <Assistant api={api} />}
           {page === "install" && (
             <>
               <p className="muted">
@@ -1055,8 +1037,11 @@ function App() {
                 <h2>Как устроены разрешения</h2>
                 <p>
                   Для таймера нужны активная вкладка, фокус окна, простой
-                  устройства, локальное хранение и уведомления. Доступ к истории
-                  запрашивается отдельно и только по твоему действию.
+                  устройства, локальное хранение и уведомления. Доступ к
+                  истории, вкладкам и HTTP/HTTPS-сайтам подтверждается при
+                  установке или обновлении расширения. Анализ истории
+                  запускается по кнопке; отправка сводки на сайт требует
+                  отдельного согласия.
                 </p>
                 <p className="muted">
                   При отсутствии ввода 2 минуты учёт сайтов останавливается.
@@ -1097,9 +1082,10 @@ function App() {
                   URL и заголовки истории не отправляются.
                 </p>
                 <p>
-                  Chrome: storage, tabs, idle, alarms, notifications; history —
-                  только по желанию. Разрешения доступны на странице расширения
-                  в Chrome. PWA не получает доступ к другим приложениям.
+                  Chrome: storage, tabs, history, idle, alarms, notifications и
+                  declarativeNetRequest; доступ к HTTP/HTTPS-сайтам нужен для
+                  перенаправления. Разрешения доступны на странице расширения в
+                  Chrome. PWA не получает доступ к другим приложениям.
                 </p>
                 <div className="export-actions">
                   <a className="button secondary" href="/api/export">
@@ -1301,6 +1287,7 @@ function App() {
                     </div>
                   ))}
                 </div>
+                <Donut intervals={detail.intervals} settings={detail.rules} />
                 <AttentionMap session={detail} />
                 {detail.source !== "mobile" && (
                   <>
@@ -1439,4 +1426,13 @@ function SessionList({
     </div>
   );
 }
-createRoot(document.getElementById("root")!).render(<App />);
+function Root() {
+  const [blocked, setBlocked] = useState(location.hash.startsWith("#blocked?"));
+  useEffect(() => {
+    const update = () => setBlocked(location.hash.startsWith("#blocked?"));
+    window.addEventListener("hashchange", update);
+    return () => window.removeEventListener("hashchange", update);
+  }, []);
+  return blocked ? <BlockedPage /> : <App />;
+}
+createRoot(document.getElementById("root")!).render(<Root />);

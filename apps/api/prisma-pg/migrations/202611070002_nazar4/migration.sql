@@ -1,0 +1,16 @@
+CREATE TABLE "DailyBudget" (
+  "userId" TEXT NOT NULL REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE,
+  "day" TEXT NOT NULL,
+  "plannedMs" INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY ("userId", "day")
+);
+CREATE TABLE "StudyPlan" (
+  "id" TEXT NOT NULL PRIMARY KEY,
+  "userId" TEXT NOT NULL REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE,
+  "day" TEXT NOT NULL,
+  "plannedMs" INTEGER NOT NULL,
+  "goal" TEXT NOT NULL,
+  "source" TEXT NOT NULL,
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX "StudyPlan_userId_day_idx" ON "StudyPlan"("userId", "day");

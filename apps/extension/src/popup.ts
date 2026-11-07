@@ -1,4 +1,4 @@
-import { matches, exceptionApplies, templates } from "@nazar/shared";
+import { isDistracting, exceptionApplies, templates } from "@nazar/shared";
 declare const __WEB_URL__: string;
 const app = document.querySelector<HTMLElement>("#app")!;
 const error = document.querySelector<HTMLElement>("#error")!;
@@ -51,7 +51,7 @@ function render() {
   }
   const a = state.active;
   const current = state.currentHost;
-  app.innerHTML = `<small>${esc(state.auth.email)}</small>${a ? `<h2>${esc(a.session.goal)}</h2><div class="timer" id="clock"></div><p class="muted" style="text-align:center">${a.pausedAt ? "На паузе" : "До конца сессии"}</p><div class="card"><p>Бюджет сайтов <strong id="budget">${clock(state.totals.distractedMs)} / ${clock(a.session.rules.budgetMs)}</strong></p><progress value="${state.totals.distractedMs}" max="${a.session.rules.budgetMs}"></progress><small id="tracked">Учтённое время: ${clock(state.totals.trackedMs)}</small></div>${a.session.warnings.length ? `<section class="warning"><b>Nazar Decision</b><p>Цель: ${esc(a.session.goal)}</p><p>Бюджет достигнут. Выберите следующий шаг.</p><button data-decision="return">Вернуться к задаче</button><button data-decision="allow5" ${!a.host || a.pausedAt ? "disabled" : ""}>Разрешить сайт на 5 минут</button><button data-decision="allow-session" ${!a.host || a.pausedAt ? "disabled" : ""}>Нужен до конца сессии</button><button data-decision="details">Подробнее</button></section>` : ""}<p>Текущий сайт: <b>${esc(current || "нет активного сайта")}</b></p><small>${current ? (a.session.exceptions.some((e: any) => exceptionApplies(e, current, Date.now())) ? "Нужен для задачи" : a.session.rules.domains.some((d: string) => matches(current, d)) ? "Отвлекающий сайт" : "Вне списка отвлечений") : "Учёт сайтов остановлен"}</small><button id="except" ${!a.host || a.pausedAt ? "disabled" : ""}>Этот сайт нужен для задачи</button><div class="row"><button id="pause">${a.pausedAt ? "Продолжить" : "Пауза"}</button><button id="finish">Завершить</button></div><label><input id="done" type="checkbox"> Задача выполнена</label><label>Заметка<textarea id="note" maxlength="500" placeholder="Что помогло вернуться к задаче?"></textarea></label>` : `<h2>Чему посвятим время?</h2><form id="start"><label>Шаблон<select id="mode">${templates.map((t) => `<option value="${t.id}">${esc(t.name)}</option>`).join("")}</select></label><label>Цель сессии<input name="goal" maxlength="200" placeholder="Разобраться с производными" required></label><label>Длительность, минуты<input name="minutes" type="number" min="0.016667" max="240" step="any" value="25" required></label><div class="card"><small>Бюджет: ${clock(state.settings.budgetMs)}. Сайты: ${esc(state.settings.domains.join(", ") || "список пуст")}</small><label><input type="checkbox" required> Подтверждаю сайты и бюджет</label></div><button class="primary">Начать сессию →</button></form>${state.lastResult ? `<p class="card">${state.lastResult.status === "interrupted" ? "Сессия прервана. Сохранены подтверждённые интервалы." : "Результат сохранён."}</p>` : ""}`}<div class="status"><b>${esc(state.syncStatus)}</b><br><small>В очереди: ${state.queueCount}${state.foreignQueueCount ? " · Есть изолированные данные другого аккаунта" : ""}<br>Последняя синхронизация: ${state.lastSync ? esc(new Date(state.lastSync).toLocaleTimeString("ru")) : "ещё не было"}</small><div class="row"><button id="sync">Синхронизировать</button><button id="disconnect" ${a ? "disabled" : ""}>Отключить</button></div></div>${state.notificationBlocked ? '<p class="warning">Системные уведомления отключены. Предупреждение доступно здесь.</p>' : ""}<details><summary>Предложения из истории</summary><p class="muted">Читаем локальные посещения за 7 дней: до 500 страниц и 50 000 посещений. Обрабатываем на устройстве. URL и заголовки не отправляются. По отдельной кнопке можно отправить сводку доменов на сайт. Отказ не влияет на таймер.</p><button id="history">Проанализировать последние 7 дней</button>${
+  app.innerHTML = `<small>${esc(state.auth.email)}</small>${a ? `<h2>${esc(a.session.goal)}</h2><div class="timer" id="clock"></div><p class="muted" style="text-align:center">${a.pausedAt ? "На паузе" : "До конца сессии"}</p><div class="card"><p>Бюджет сайтов <strong id="budget">${clock(state.totals.distractedMs)} / ${clock(a.session.rules.budgetMs)}</strong></p><progress value="${state.totals.distractedMs}" max="${a.session.rules.budgetMs}"></progress><small id="tracked">Учтённое время: ${clock(state.totals.trackedMs)}</small></div>${a.session.warnings.length ? `<section class="warning"><b>Smart Break</b><p>Цель: ${esc(a.session.goal)}</p><p>Ваше время закончилось. Пора вернуться к запланированной задаче.</p><button id="openBlocked">Focus Delay · выбрать действие</button></section>` : ""}<p>Текущий сайт: <b>${esc(current || "нет активного сайта")}</b></p><small>${current ? (a.session.exceptions.some((e: any) => exceptionApplies(e, current, Date.now())) ? "Нужен для задачи" : isDistracting(a.session.rules, current) ? "Отвлекающий сайт" : "Вне списка отвлечений") : "Учёт сайтов остановлен"}</small><button id="except" ${!a.host || a.pausedAt ? "disabled" : ""}>Этот сайт нужен для задачи</button><div class="row"><button id="pause">${a.pausedAt ? "Продолжить" : "Пауза"}</button><button id="finish">Завершить</button></div><label><input id="done" type="checkbox"> Задача выполнена</label><label>Заметка<textarea id="note" maxlength="500" placeholder="Что помогло вернуться к задаче?"></textarea></label>` : `<h2>Сколько времени вы планируете сегодня заниматься?</h2><form id="start"><div class="row">${[5, 15, 30, 60, 120].map((m) => `<button type="button" data-minutes="${m}">${m}</button>`).join("")}</div><small>Минуты · суммарно до 4 часов в сутки</small><label>Шаблон<select id="mode">${templates.map((t) => `<option value="${t.id}">${esc(t.name)}</option>`).join("")}</select></label><label>Цель сессии<input name="goal" maxlength="200" placeholder="Разобраться с производными" required></label><label>Длительность, минуты<input name="minutes" type="number" min="0.016667" max="240" step="any" value="25" required></label><div class="card"><small>Бюджет: ${clock(state.settings.budgetMs)}. Сайты: ${esc(state.settings.domains.join(", ") || "список пуст")}</small><label><input type="checkbox" required> Подтверждаю сайты и бюджет</label></div><button class="primary">Начать сессию →</button></form>${state.lastResult ? `<p class="card">${state.lastResult.status === "interrupted" ? "Сессия прервана. Сохранены подтверждённые интервалы." : "Результат сохранён."}</p>` : ""}`}<div class="status"><b>${esc(state.syncStatus)}</b><br><small>В очереди: ${state.queueCount}${state.foreignQueueCount ? " · Есть изолированные данные другого аккаунта" : ""}<br>Последняя синхронизация: ${state.lastSync ? esc(new Date(state.lastSync).toLocaleTimeString("ru")) : "ещё не было"}</small><div class="row"><button id="sync">Синхронизировать</button><button id="disconnect" ${a ? "disabled" : ""}>Отключить</button></div></div>${state.notificationBlocked ? '<p class="warning">Системные уведомления отключены. Предупреждение доступно здесь.</p>' : ""}<details><summary>Предложения из истории</summary><p class="muted">Читаем локальные посещения за 7 дней: до 500 страниц и 50 000 посещений. Обрабатываем на устройстве. URL и заголовки не отправляются. По отдельной кнопке можно отправить сводку доменов на сайт. Доступ к истории подтверждается при установке или обновлении расширения. Анализ запускается только этой кнопкой.</p><button id="history">Проанализировать последние 7 дней</button>${
     state.history
       ? `<p>${state.history.complete ? "Выборка в пределах лимитов" : "Выборка может быть неполной"} · только посещения, без времени просмотра</p><form id="choose">${state.history.domains
           .slice(0, 40)
@@ -64,6 +64,13 @@ function render() {
           )}<button>Добавить выбранные сайты</button></form><button id="share">Отправить сводку на сайт</button>`
       : ""
   }<button id="clear">Удалить локальные результаты и сводку</button><small>История Chrome останется. Неотправленные результаты этого аккаунта будут удалены.</small></details>`;
+  document.querySelectorAll<HTMLButtonElement>("[data-minutes]").forEach((b) =>
+    b.addEventListener("click", () => {
+      (
+        document.querySelector("input[name=minutes]") as HTMLInputElement
+      ).value = b.dataset.minutes!;
+    }),
+  );
   document.querySelector("#start")?.addEventListener("submit", (e) => {
     e.preventDefault();
     const f = new FormData(e.target as HTMLFormElement);
@@ -71,6 +78,7 @@ function render() {
   });
   for (const [id, type] of [
     ["except", "except"],
+    ["openBlocked", "openBlocked"],
     ["pause", a?.pausedAt ? "resume" : "pause"],
     ["sync", "sync"],
     ["disconnect", "disconnect"],
@@ -90,12 +98,7 @@ function render() {
   );
   document.getElementById("history")?.addEventListener("click", async () => {
     try {
-      const granted = await chrome.permissions.request({
-        permissions: ["history"],
-      });
-      if (granted) await action("history");
-      else
-        error.textContent = "Доступ не предоставлен. Основной таймер работает.";
+      await action("history");
     } catch (e: any) {
       error.textContent = e.message;
     }

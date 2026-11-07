@@ -43,17 +43,19 @@ try {
   const files = unzipSync(new Uint8Array(await zip.arrayBuffer()));
   const manifest = JSON.parse(strFromU8(files["manifest.json"]));
   assert.equal(manifest.manifest_version, 3);
-  assert.deepEqual(manifest.optional_permissions, ["history"]);
-  assert.ok(!manifest.permissions.includes("history"));
+  assert.ok(manifest.permissions.includes("history"));
+  assert.ok(manifest.permissions.includes("tabs"));
   assert.ok(!manifest.host_permissions.includes("<all_urls>"));
-  assert.deepEqual(manifest.host_permissions, [
-    new URL(
-      process.env.NAZAR_PUBLIC_ORIGIN ||
-        process.env.NAZAR_API_URL ||
-        "http://localhost:3001",
-    ).origin + "/*",
-  ]);
-  assert.ok(files["worker.js"] && files["popup.js"] && files["icon.png"]);
+  assert.deepEqual(manifest.host_permissions, ["http://*/*", "https://*/*"]);
+  assert.ok(manifest.permissions.includes("declarativeNetRequest"));
+  assert.equal(manifest.version, "0.4.0");
+  assert.ok(manifest.externally_connectable.matches.length === 1);
+  assert.ok(
+    files["worker.js"] &&
+      files["popup.js"] &&
+      files["bridge.js"] &&
+      files["icon.png"],
+  );
   assert.match(strFromU8(files["worker.js"]), /credentials:\s*["']omit["']/);
   const reg = await fetch("http://localhost:3002/api/auth/register", {
     method: "POST",

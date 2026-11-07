@@ -12,6 +12,13 @@ import {
   countVisits,
   canUpload,
   settingsSchema,
+  blockedDomains,
+  chatPath,
+  FOCUS_DELAY_MS,
+  CHAT_PASS_MS,
+  siteLimit,
+  siteUsage,
+  dayKey,
   type Active,
   type Session,
   type Settings,
@@ -45,8 +52,14 @@ interface Store {
   historyOwner: string | null;
   lastResult: Session | null;
   notificationBlocked: boolean;
+  focus?: Record<string, number>;
+  chatPass?: { domain: string; expiresAt: number } | null;
+  pendingPlan?: { id: string; goal: string; plannedMs: number; day: string };
+  restrictionSession?: Session | null;
 }
 let store: Store;
+let nextLimitTimer: ReturnType<typeof setTimeout> | undefined;
+let appliedRules = "";
 let chain = Promise.resolve();
 const serial = <T>(fn: () => Promise<T>): Promise<T> => {
   const p = chain.then(fn);
@@ -57,6 +70,7 @@ const serial = <T>(fn: () => Promise<T>): Promise<T> => {
   return p;
 };
 const persist = async () => {
+  await enforceRules();
   await chrome.storage.local.set({ nazar: store });
   if (chrome.action) {
     const a = store.active;
@@ -74,6 +88,95 @@ const persist = async () => {
     });
   }
 };
+function blocked() {
+  return blockedDomains(
+    store.settings,
+    store.active?.session ?? store.restrictionSession ?? null,
+    Date.now(),
+  );
+}
+function blockUrl(domain: string) {
+  return (
+    __WEB_URL__ +
+    "/#blocked?domain=" +
+    encodeURIComponent(domain) +
+    "&extension=" +
+    chrome.runtime.id
+  );
+}
+async function enforceRules() {
+  if (!chrome.declarativeNetRequest) return;
+  const now = Date.now();
+  if (store.chatPass && store.chatPass.expiresAt <= now) store.chatPass = null;
+  const domains = blocked();
+  const protectedHosts = [
+    new URL(__WEB_URL__).hostname,
+    new URL(__API_URL__).hostname,
+  ];
+  const rules: chrome.declarativeNetRequest.Rule[] = domains.map(
+    (domain, n) => ({
+      id: n + 1,
+      priority: 1,
+      action: {
+        type: chrome.declarativeNetRequest.RuleActionType.REDIRECT,
+        redirect: { url: blockUrl(domain) },
+      },
+      condition: {
+        requestDomains: [domain],
+        excludedRequestDomains: protectedHosts,
+        resourceTypes: [chrome.declarativeNetRequest.ResourceType.MAIN_FRAME],
+      },
+    }),
+  );
+  const pass = store.chatPass;
+  if (pass && chatPath(pass.domain)) {
+    rules.push({
+      id: 10001,
+      priority: 2,
+      action: { type: chrome.declarativeNetRequest.RuleActionType.ALLOW },
+      condition: {
+        regexFilter:
+          "^https://([a-z0-9-]+\\.)*" +
+          pass.domain.replaceAll(".", "\\.") +
+          chatPath(pass.domain),
+        resourceTypes: [chrome.declarativeNetRequest.ResourceType.MAIN_FRAME],
+      },
+    });
+    await chrome.alarms.create("chat-expiry", { when: pass.expiresAt });
+  }
+  const signature = JSON.stringify(rules);
+  if (signature !== appliedRules) {
+    const old = await chrome.declarativeNetRequest.getDynamicRules();
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: old.map((r) => r.id),
+      addRules: rules,
+    });
+    appliedRules = signature;
+  }
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    if (tab.id === undefined || !tab.url || !/^https?:/.test(tab.url)) continue;
+    const host = domainOf(tab.url);
+    if (
+      host &&
+      protectedHosts.some((p) => host === p || host.endsWith("." + p))
+    )
+      continue;
+    const domain = domains.find(
+      (d) => host && (host === d || host.endsWith("." + d)),
+    );
+    if (!domain) continue;
+    const url = new URL(tab.url);
+    if (
+      pass?.domain === domain &&
+      pass.expiresAt > now &&
+      url.protocol === "https:" &&
+      url.pathname.startsWith(chatPath(domain) ?? "\0")
+    )
+      continue;
+    await chrome.tabs.update(tab.id, { url: blockUrl(domain) }).catch(() => {});
+  }
+}
 async function request(
   path: string,
   method = "GET",
@@ -147,10 +250,12 @@ async function sync(force = false) {
 }
 async function finish(interrupted = false, done = false) {
   if (!store.active) return;
+  if (nextLimitTimer) clearTimeout(nextLimitTimer);
   const a = store.active;
   a.session.status = interrupted ? "interrupted" : "completed";
   a.session.taskDone = done;
   store.lastResult = structuredClone(a.session);
+  store.restrictionSession = interrupted ? structuredClone(a.session) : null;
   if (store.auth)
     store.queue.push({
       ownerId: store.auth.ownerId,
@@ -160,6 +265,8 @@ async function finish(interrupted = false, done = false) {
       nextAt: 0,
     });
   store.active = null;
+  store.focus = {};
+  store.chatPass = null;
   store.syncStatus = "Ожидает отправки";
   await persist();
 }
@@ -208,6 +315,23 @@ async function checkpoint(now = Date.now(), override?: null) {
   }
   a.host =
     a.pausedAt !== null || override === null ? null : await observeHost();
+  if (nextLimitTimer) clearTimeout(nextLimitTimer);
+  if (a.host && a.pausedAt === null) {
+    const rule = siteLimit(a.session.rules, a.host);
+    const remaining = rule
+      ? rule.limitMs - siteUsage(a.session, rule.domain)
+      : Number.POSITIVE_INFINITY;
+    const budget = a.session.rules.domains.some(
+      (d) => a.host === d || a.host!.endsWith("." + d),
+    )
+      ? a.session.rules.budgetMs - totals(a.session).distractedMs
+      : Number.POSITIVE_INFINITY;
+    const delay = Math.min(remaining, budget, a.deadline - now);
+    if (Number.isFinite(delay) && delay > 0) {
+      nextLimitTimer = setTimeout(() => event(), delay);
+      if (typeof nextLimitTimer === "object") nextLimitTimer.unref();
+    }
+  }
   await persist();
 }
 async function init() {
@@ -232,6 +356,8 @@ async function init() {
     store.active.session.interruption = "worker-restart";
     await finish(true);
   }
+  store.focus ??= {};
+  store.chatPass = null;
   await persist();
   chrome.idle.setDetectionInterval(120);
   await chrome.alarms.create("checkpoint", { periodInMinutes: 0.5 });
@@ -311,6 +437,24 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (sender.id !== chrome.runtime.id) return false;
   void serial(async () => {
     await ready;
+    if (sender.tab) {
+      let trusted = false;
+      try {
+        trusted =
+          new URL(sender.url ?? "").origin === new URL(__WEB_URL__).origin;
+      } catch {}
+      if (
+        !trusted ||
+        !["state", "start", "pause", "resume", "finish", "sync"].includes(
+          msg.type,
+        )
+      )
+        throw Error("Недопустимая команда сайта");
+      if (msg.webOwnerId !== store.auth?.ownerId)
+        throw Error(
+          "Расширение подключено к другому аккаунту. Переподключите его в разделе «Расширение».",
+        );
+    }
     await checkpoint();
     switch (msg.type) {
       case "state":
@@ -326,6 +470,10 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         store.history = null;
         store.historyOwner = null;
         store.lastResult = null;
+        store.restrictionSession = null;
+        store.pendingPlan = undefined;
+        store.focus = {};
+        store.chatPass = null;
         await persist();
         await sync(true);
         break;
@@ -338,6 +486,10 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         store.auth = null;
         store.history = null;
         store.lastResult = null;
+        store.restrictionSession = null;
+        store.pendingPlan = undefined;
+        store.focus = {};
+        store.chatPass = null;
         store.settings = structuredClone(defaults);
         store.syncStatus = "Нужен вход";
         await persist();
@@ -358,21 +510,42 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
           minutes > 240
         )
           throw Error("Укажите цель и длительность от 1 секунды до 240 минут");
+        const plannedMs = Math.round(minutes * 60000);
+        const pending = store.pendingPlan;
+        const day = dayKey(Date.now(), "Asia/Qyzylorda");
+        const id =
+          pending?.goal === goal &&
+          pending.plannedMs === plannedMs &&
+          pending.day === day
+            ? pending.id
+            : crypto.randomUUID();
+        store.pendingPlan = { id, goal, plannedMs, day };
+        await persist();
+        await request("/api/plans", "POST", {
+          id,
+          goal,
+          plannedMs,
+          source: "extension",
+        });
         store.active = createActive(
-          crypto.randomUUID(),
+          id,
           store.instanceId,
           goal,
           Math.round(minutes * 60000),
           store.settings,
           Date.now(),
         );
+        store.restrictionSession = null;
+        store.pendingPlan = undefined;
+        store.focus = {};
+        store.chatPass = null;
         store.active.host = await observeHost();
         const tabs = await chrome.tabs.query({
           active: true,
           lastFocusedWindow: true,
         });
         store.active.taskTabId = tabs[0]?.id;
-        await persist();
+        await checkpoint();
         break;
       }
       case "pause":
@@ -390,6 +563,14 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         break;
       case "except":
         if (store.active?.host) {
+          if (
+            blocked().some(
+              (d) =>
+                store.active!.host === d ||
+                store.active!.host!.endsWith("." + d),
+            )
+          )
+            throw Error("Используйте Focus Delay на странице ограничения");
           except(store.active, store.active.host, Date.now());
           await persist();
         }
@@ -397,6 +578,16 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       case "decision": {
         if (!store.active) throw Error("Нет активной сессии");
         const action = decisionSchema.shape.action.parse(msg.action);
+        if (action === "chat-pass" || action === "focus-delay")
+          throw Error("Откройте страницу ограничения Nazar");
+        if (
+          (action === "allow5" || action === "allow-session") &&
+          (store.active.session.rules.allowExtraTime !== true ||
+            blocked().length)
+        )
+          throw Error(
+            "Дополнительное время доступно через Focus Delay, если разрешено в правилах",
+          );
         if (
           (action === "allow5" || action === "allow-session") &&
           !store.active.host
@@ -430,6 +621,12 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       case "sync":
         await sync(true);
         break;
+      case "openBlocked": {
+        const domain = blocked()[0];
+        if (!domain) throw Error("Активных ограничений нет");
+        await chrome.tabs.create({ url: blockUrl(domain) });
+        break;
+      }
       case "history":
         await importHistory();
         break;
@@ -482,6 +679,92 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       lastResult: store.lastResult,
       currentHost: await observeHost(),
       totals: store.active ? totals(store.active.session) : null,
+    };
+  }).then(
+    (state) => respond({ ok: true, state }),
+    (e) => respond({ ok: false, error: e.message }),
+  );
+  return true;
+});
+
+// The website can only control the narrow blocked-page flow; it never receives credentials.
+chrome.runtime.onMessageExternal?.addListener((msg, sender, respond) => {
+  let trusted = false;
+  try {
+    trusted = new URL(sender.url ?? "").origin === new URL(__WEB_URL__).origin;
+  } catch {}
+  if (!trusted) return false;
+  void serial(async () => {
+    await ready;
+    await checkpoint();
+    const domain = domainOf(String(msg.domain ?? ""));
+    if (!domain || !blocked().includes(domain))
+      throw Error("Ограничение больше не действует. Вернитесь к задаче.");
+    const a = store.active;
+    const rules = a?.session.rules ?? store.settings;
+    const hard = siteLimit(rules, domain)?.limitMs === 0;
+    const now = Date.now();
+    store.focus ??= {};
+    if (msg.type === "focus") {
+      if (!store.focus[domain]) {
+        store.focus[domain] = now + FOCUS_DELAY_MS;
+        if (a) decide(a, "focus-delay", domain, now);
+      }
+    } else if (
+      msg.type === "chat" ||
+      msg.type === "extra" ||
+      msg.type === "return"
+    ) {
+      if (!store.focus[domain] || now < store.focus[domain])
+        throw Error("Дождитесь завершения 15-секундной паузы");
+      if (!a || a.pausedAt !== null)
+        throw Error("Начните или продолжите учебную сессию в расширении");
+      if (msg.type === "chat") {
+        if (hard || !chatPath(domain))
+          throw Error("Для этого сайта Chat Pass недоступен");
+        if (
+          a.session.decisions?.some(
+            (d) => d.action === "chat-pass" && d.domain === domain,
+          )
+        )
+          throw Error("Chat Pass уже использован для этого сайта в сессии");
+        const expiresAt = Math.min(a.deadline, now + CHAT_PASS_MS);
+        store.chatPass = { domain, expiresAt };
+        (a.session.decisions ??= []).push({
+          domain,
+          at: now,
+          kind: "budget",
+          action: "chat-pass",
+          expiresAt,
+        });
+        await persist();
+        return { navigate: "https://" + domain + chatPath(domain) };
+      }
+      if (msg.type === "extra") {
+        if (hard || rules.allowExtraTime !== true)
+          throw Error("Дополнительное время отключено в правилах");
+        decide(a, "allow5", domain, now);
+        await persist();
+        return { navigate: "https://" + domain + "/" };
+      }
+      decide(a, "return", domain, now);
+      if (a.taskTabId !== undefined)
+        await chrome.tabs.update(a.taskTabId, { active: true }).catch(() => {});
+    } else if (msg.type !== "blocked-state") throw Error("Неизвестная команда");
+    await persist();
+    return {
+      domain,
+      goal: a?.session.goal ?? "Вернитесь к запланированной задаче",
+      readyAt: store.focus[domain] ?? null,
+      canChat:
+        !!a &&
+        !hard &&
+        !!chatPath(domain) &&
+        !a.session.decisions?.some(
+          (d) => d.action === "chat-pass" && d.domain === domain,
+        ),
+      canExtra: !!a && !hard && rules.allowExtraTime === true,
+      hard,
     };
   }).then(
     (state) => respond({ ok: true, state }),

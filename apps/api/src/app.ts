@@ -16,11 +16,15 @@ import {
   historySchema,
   totals,
   splitDays,
+  dayKey,
+  dailyReport,
+  DAILY_PLAN_MS,
 } from "@nazar/shared";
 import { db } from "./db.ts";
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { DatabaseRateLimitStore } from "./rate-limit.ts";
+import { nazarAssistant } from "./assistant.ts";
 const digest = (s: string) => createHash("sha256").update(s).digest("hex");
 const token = () => randomBytes(32).toString("base64url");
 const production =
@@ -112,8 +116,9 @@ export function createApp() {
         req.method === "POST" &&
         req.path === "/pair/exchange";
       const deviceRoute =
-        ["/settings", "/history", "/auth/logout"].includes(req.path) ||
-        /^\/sessions\/[^/]+$/.test(req.path);
+        ["/settings", "/history", "/auth/logout", "/plans"].includes(
+          req.path,
+        ) || /^\/sessions\/[^/]+$/.test(req.path);
       const extensionDeviceRequest = extensionOrigin && bearer && deviceRoute;
       if (
         requestOrigin &&
@@ -348,6 +353,202 @@ export function createApp() {
     });
     res.json(v);
   });
+  const planInput = z.object({
+    id: z.uuid(),
+    plannedMs: z.number().int().min(1000).max(DAILY_PLAN_MS),
+    goal: z.string().trim().min(1).max(200),
+    source: z.enum(["mobile", "extension"]),
+  });
+  async function todayBudget(id: string) {
+    const u = await db.user.findUniqueOrThrow({ where: { id } });
+    const timezone = JSON.parse(u.settings).timezone;
+    // Use a fixed account planning timezone: changing display timezone must not reset the cap.
+    const day = dayKey(Date.now(), "Asia/Qyzylorda");
+    let budget = await db.dailyBudget.findUnique({
+      where: { userId_day: { userId: id, day } },
+    });
+    if (!budget) {
+      const center = Date.now();
+      const old = await db.studySession.findMany({
+        where: {
+          userId: id,
+          startedAt: {
+            gte: new Date(center - 2 * 86400000),
+            lte: new Date(center),
+          },
+        },
+      });
+      const legacyMs = old
+        .map((r) => sessionSchema.parse(JSON.parse(r.payload)))
+        .filter((s) => dayKey(s.startedAt, "Asia/Qyzylorda") === day)
+        .reduce((n, s) => n + s.plannedMs, 0);
+      budget = await db.dailyBudget.upsert({
+        where: { userId_day: { userId: id, day } },
+        create: { userId: id, day, plannedMs: legacyMs },
+        update: {},
+      });
+    }
+    return {
+      day,
+      timezone,
+      planningTimezone: "Asia/Qyzylorda",
+      plannedMs: budget?.plannedMs ?? 0,
+      remainingMs: Math.max(0, DAILY_PLAN_MS - (budget?.plannedMs ?? 0)),
+      maxMs: DAILY_PLAN_MS,
+    };
+  }
+  app.get("/api/plans", auth, async (req, res) =>
+    res.json(await todayBudget(userId(req))),
+  );
+  app.post("/api/plans", auth, async (req, res) => {
+    const v = planInput.parse(req.body),
+      id = userId(req);
+    need(
+      v.source ===
+        ((req as Authed).auth.kind === "web" ? "mobile" : "extension"),
+      403,
+      "Источник плана не совпадает с устройством",
+    );
+    const { day } = await todayBudget(id);
+    const existing = await db.studyPlan.findUnique({ where: { id: v.id } });
+    if (existing) {
+      need(
+        existing.userId === id &&
+          existing.day === day &&
+          existing.plannedMs === v.plannedMs &&
+          existing.goal === v.goal &&
+          existing.source === v.source,
+        409,
+        "План уже зарегистрирован с другими данными",
+      );
+      return res.json(await todayBudget(id));
+    }
+    try {
+      await db.$transaction(async (tx) => {
+        await tx.dailyBudget.upsert({
+          where: { userId_day: { userId: id, day } },
+          create: { userId: id, day },
+          update: {},
+        });
+        const changed = await tx.dailyBudget.updateMany({
+          where: {
+            userId: id,
+            day,
+            plannedMs: { lte: DAILY_PLAN_MS - v.plannedMs },
+          },
+          data: { plannedMs: { increment: v.plannedMs } },
+        });
+        need(
+          changed.count === 1,
+          409,
+          "На сегодня осталось меньше времени. Суточный предел — 4 часа.",
+        );
+        await tx.studyPlan.create({ data: { ...v, userId: id, day } });
+      });
+    } catch (e: any) {
+      const saved = await db.studyPlan.findUnique({ where: { id: v.id } });
+      if (
+        saved?.userId === id &&
+        saved.day === day &&
+        saved.plannedMs === v.plannedMs &&
+        saved.goal === v.goal &&
+        saved.source === v.source
+      )
+        return res.json(await todayBudget(id));
+      if (e.code === "P2002") throw new HttpError(409, "Конфликт плана");
+      throw e;
+    }
+    res.status(201).json(await todayBudget(id));
+  });
+  app.get("/api/analytics", auth, async (req, res) => {
+    const v = z
+      .object({
+        from: z.coerce.number().int().nonnegative(),
+        to: z.coerce.number().int().nonnegative(),
+      })
+      .refine((v) => v.to > v.from && v.to - v.from <= 32 * 86400000)
+      .parse(req.query);
+    const rows = await db.studySession.findMany({
+      where: {
+        userId: userId(req),
+        startedAt: { lt: new Date(v.to) },
+        endedAt: { gte: new Date(v.from) },
+      },
+    });
+    res.json(rows.map((r) => sessionSchema.parse(JSON.parse(r.payload))));
+  });
+  app.get("/api/reports/daily", auth, async (req, res) => {
+    const day = z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .parse(req.query.day);
+    const u = await db.user.findUniqueOrThrow({ where: { id: userId(req) } });
+    const tz = JSON.parse(u.settings).timezone;
+    const center = Date.parse(day + "T12:00:00Z");
+    need(Number.isFinite(center), 400, "Некорректная дата");
+    const rows = await db.studySession.findMany({
+      where: {
+        userId: u.id,
+        startedAt: { lt: new Date(center + 2 * 86400000) },
+        endedAt: { gte: new Date(center - 2 * 86400000) },
+      },
+    });
+    const report = dailyReport(
+      rows.map((r) => sessionSchema.parse(JSON.parse(r.payload))),
+      day,
+      tz,
+    );
+    const plans = await db.studyPlan.findMany({ where: { userId: u.id, day } });
+    res.json({
+      ...report,
+      reservedMs: plans.reduce((n, p) => n + p.plannedMs, 0),
+      planningTimezone: "Asia/Qyzylorda",
+    });
+  });
+  app.post(
+    "/api/assistant",
+    auth,
+    webOnly,
+    rateLimit({
+      store: new DatabaseRateLimitStore("ai"),
+      windowMs: 60000,
+      limit: 6,
+      message: { error: "Помощник: до 6 запросов в минуту" },
+    }),
+    async (req, res) => {
+      const v = z
+        .object({
+          goal: z.string().trim().max(500),
+          useAI: z.boolean(),
+          day: z
+            .string()
+            .regex(/^\d{4}-\d{2}-\d{2}$/)
+            .optional(),
+        })
+        .parse(req.body);
+      const u = await db.user.findUniqueOrThrow({ where: { id: userId(req) } });
+      const tz = JSON.parse(u.settings).timezone;
+      const center = v.day ? Date.parse(v.day + "T12:00:00Z") : Date.now();
+      need(Number.isFinite(center), 400, "Некорректная дата");
+      const rows = await db.studySession.findMany({
+        where: {
+          userId: u.id,
+          startedAt: { lt: new Date(center + 2 * 86400000) },
+          endedAt: { gte: new Date(center - 7 * 86400000) },
+        },
+        take: 500,
+        orderBy: { startedAt: "desc" },
+      });
+      const reports = Array.from({ length: 7 }, (_, n) =>
+        dailyReport(
+          rows.map((r) => sessionSchema.parse(JSON.parse(r.payload))),
+          dayKey(center - n * 86400000, tz),
+          tz,
+        ),
+      );
+      res.json(await nazarAssistant(v.goal, reports, v.useAI));
+    },
+  );
   app.put("/api/sessions/:clientSessionId", auth, async (req, res) => {
     const v = sessionSchema.parse(req.body);
     if (v.source === "mobile")
@@ -565,6 +766,10 @@ export function createApp() {
       exportedAt: new Date().toISOString(),
       user: { id: u.id, email: u.email },
       settings: JSON.parse(u.settings),
+      plans: await db.studyPlan.findMany({
+        where: { userId: u.id },
+        orderBy: { createdAt: "desc" },
+      }),
       history: u.history ? JSON.parse(u.history) : null,
       sessions: rows.map((r) => ({ id: r.id, ...JSON.parse(r.payload) })),
     });

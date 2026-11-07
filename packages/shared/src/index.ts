@@ -34,6 +34,15 @@ export const settingsSchema = z.object({
   }, "Неизвестный часовой пояс"),
   shareHistory: z.boolean(),
   weeklyGoal: z.number().int().min(0).max(100).optional(),
+  siteLimits: z
+    .array(z.object({ domain, limitMs: z.number().int().min(0).max(86400000) }))
+    .max(100)
+    .refine(
+      (r) => new Set(r.map((v) => v.domain)).size === r.length,
+      "Уберите повторяющиеся домены",
+    )
+    .optional(),
+  allowExtraTime: z.boolean().optional(),
 });
 export type Settings = z.infer<typeof settingsSchema>;
 export const defaults: Settings = {
@@ -61,7 +70,14 @@ export const decisionSchema = z.object({
   domain: domain.optional(),
   at: z.number().int().nonnegative(),
   kind: z.enum(["budget", "context"]),
-  action: z.enum(["return", "allow5", "allow-session", "details"]),
+  action: z.enum([
+    "return",
+    "allow5",
+    "allow-session",
+    "details",
+    "focus-delay",
+    "chat-pass",
+  ]),
   expiresAt: z.number().int().nonnegative().optional(),
 });
 export const sessionSchema = z
@@ -85,8 +101,14 @@ export const sessionSchema = z
     intervals: z.array(intervalSchema).max(20000),
     exceptions: z.array(exceptionSchema).max(200),
     warnings: z
-      .array(z.object({ at: z.number().int(), kind: z.literal("budget") }))
-      .max(1),
+      .array(
+        z.object({
+          at: z.number().int(),
+          kind: z.enum(["budget", "site-limit"]),
+          domain: domain.optional(),
+        }),
+      )
+      .max(201),
   })
   .superRefine((s, ctx) => {
     const issue = (message: string) =>
@@ -105,7 +127,7 @@ export const sessionSchema = z
       last = i.end;
       total += i.end - i.start;
       const expected =
-        s.rules.domains.some((d) => matches(i.domain, d)) &&
+        isDistracting(s.rules, i.domain) &&
         !s.exceptions.some((e) => exceptionApplies(e, i.domain, i.start));
       if (
         i.distracting !== expected ||
@@ -305,7 +327,7 @@ export function settle(a: Active, now: number) {
           stop = boundaries[n + 1];
         if (stop <= start) continue;
         const distracting =
-          a.session.rules.domains.some((d) => matches(a.host!, d)) &&
+          isDistracting(a.session.rules, a.host!) &&
           !a.session.exceptions.some((e) =>
             exceptionApplies(e, a.host!, start),
           );
@@ -336,10 +358,24 @@ export function settle(a: Active, now: number) {
   a.lastCheckpoint = now;
   a.session.endedAt = end;
   if (
-    !a.session.warnings.length &&
+    !a.session.warnings.some((w) => w.kind === "budget") &&
     totals(a.session).distractedMs >= a.session.rules.budgetMs
   )
     a.session.warnings.push({ kind: "budget", at: end });
+  for (const rule of a.session.rules.siteLimits ?? []) {
+    if (
+      rule.limitMs > 0 &&
+      siteUsage(a.session, rule.domain) >= rule.limitMs &&
+      !a.session.warnings.some(
+        (w) => w.kind === "site-limit" && w.domain === rule.domain,
+      )
+    )
+      a.session.warnings.push({
+        at: end,
+        kind: "site-limit",
+        domain: rule.domain,
+      });
+  }
   return a;
 }
 export function pause(a: Active, now: number) {
@@ -467,3 +503,119 @@ export const templates = [
   },
   { id: "custom", name: "Своя задача", goal: "", minutes: 25 },
 ];
+
+export const DAILY_PLAN_MS = 4 * 60 * 60000;
+export function isDistracting(settings: Settings, host: string) {
+  return [
+    ...settings.domains,
+    ...(settings.siteLimits ?? []).map((r) => r.domain),
+  ].some((d) => matches(host, d));
+}
+export const FOCUS_DELAY_MS = 15000;
+export const CHAT_PASS_MS = 10 * 60000;
+export function siteLimit(settings: Settings, host: string) {
+  return settings.siteLimits
+    ?.filter((r) => matches(host, r.domain))
+    .sort((a, b) => b.domain.length - a.domain.length)[0];
+}
+export function siteUsage(s: Session, host: string) {
+  return s.intervals
+    .filter((i) => matches(i.domain, host))
+    .reduce((n, i) => n + i.end - i.start, 0);
+}
+// Only routes whose messaging section can be separated from the feed.
+export function chatPath(host: string): string | null {
+  if (matches(host, "instagram.com")) return "/direct/";
+  if (matches(host, "facebook.com")) return "/messages/";
+  return null;
+}
+export function blockedDomains(
+  settings: Settings,
+  session: Session | null,
+  now: number,
+) {
+  const rules = session?.rules ?? settings;
+  const blocked = new Set<string>();
+  for (const r of rules.siteLimits ?? [])
+    if (
+      r.limitMs === 0 ||
+      (session && siteUsage(session, r.domain) >= r.limitMs)
+    )
+      blocked.add(r.domain);
+  if (session && totals(session).distractedMs >= rules.budgetMs)
+    for (const d of [
+      ...rules.domains,
+      ...(rules.siteLimits ?? []).map((r) => r.domain),
+    ])
+      blocked.add(d);
+  return [...blocked].filter(
+    (d) =>
+      siteLimit(rules, d)?.limitMs === 0 ||
+      !session?.exceptions.some((e) => exceptionApplies(e, d, now)),
+  );
+}
+export function domainBreakdown(intervals: Interval[], max = 7) {
+  const map = new Map<string, number>();
+  for (const i of intervals)
+    map.set(i.domain, (map.get(i.domain) ?? 0) + i.end - i.start);
+  const sorted = [...map].sort((a, b) => b[1] - a[1]);
+  const rows = sorted.slice(0, max).map(([domain, ms]) => ({ domain, ms }));
+  if (sorted.length > max)
+    rows.push({
+      domain: "Другие",
+      ms: sorted.slice(max).reduce((n, [, ms]) => n + ms, 0),
+    });
+  return rows;
+}
+export function dailyReport(sessions: Session[], day: string, tz: string) {
+  const selected = sessions.filter((s) => dayKey(s.startedAt, tz) === day);
+  const intervals = sessions.flatMap((s) =>
+    s.intervals.flatMap((i) => {
+      // Keep exact day boundaries, including sessions spanning midnight.
+      let cursor = i.start;
+      return splitDays(i, tz).flatMap((p) => {
+        const start = cursor;
+        cursor += p.ms;
+        return p.day === day ? [{ ...i, start, end: cursor }] : [];
+      });
+    }),
+  );
+  return {
+    day,
+    timezone: tz,
+    plannedMs: selected.reduce((n, s) => n + s.plannedMs, 0),
+    elapsedMs: sessions
+      .filter((s) => dayKey(s.endedAt, tz) === day)
+      .reduce((n, s) => n + s.elapsedMs, 0),
+    trackedMs: intervals.reduce((n, i) => n + i.end - i.start, 0),
+    distractedMs: intervals
+      .filter((i) => i.distracting)
+      .reduce((n, i) => n + i.end - i.start, 0),
+    completed: sessions.filter(
+      (s) => dayKey(s.endedAt, tz) === day && s.status === "completed",
+    ).length,
+    taskDone: selected.filter((s) => s.taskDone).length,
+    warnings: sessions.reduce(
+      (n, s) => n + s.warnings.filter((w) => dayKey(w.at, tz) === day).length,
+      0,
+    ),
+    chatPasses: sessions.reduce(
+      (n, s) =>
+        n +
+        (s.decisions ?? []).filter(
+          (d) => d.action === "chat-pass" && dayKey(d.at, tz) === day,
+        ).length,
+      0,
+    ),
+    withinBudget: selected.filter(
+      (s) =>
+        s.source !== "mobile" &&
+        totals(s).overBudgetMs === 0 &&
+        !(s.rules.siteLimits ?? []).some(
+          (r) => siteUsage(s, r.domain) > r.limitMs,
+        ),
+    ).length,
+    extensionSessions: selected.filter((s) => s.source !== "mobile").length,
+    domains: domainBreakdown(intervals),
+  };
+}

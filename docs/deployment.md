@@ -1,5 +1,7 @@
 # Nazar 3.1 — Vercel и постоянная база
 
+> Обновление 4.0: добавлена миграция `202611070002_nazar4` для PostgreSQL и SQLite. Новое расширение требует `declarativeNetRequest` и `http://*/*`, `https://*/*`; точный origin сохранён для `externally_connectable`. Исторические сведения ниже о единственном host permission относятся к 3.1. Перед публикацией 4.0 примените добавочную миграцию без пересоздания базы и проверьте новый ZIP. См. [nazar4.md](nazar4.md). Текущее подключение Vercel вернуло 403; публикация 4.0 не выполнена.
+
 ## Фактический статус
 
 Production **READY**: https://nazar-orpin.vercel.app . Проверены публичный сайт и API `/api/health` (HTTP 200, реальная PostgreSQL), Secure cookie, защита Origin/CSRF, MV3 exchange/replay/Bearer, запись и повторная отправка сессии/экспорт, PWA-ресурсы и production ZIP. Тестовый API-аккаунт удалён после проверки. Дата: 7 ноября 2026.

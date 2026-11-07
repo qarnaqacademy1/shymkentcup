@@ -41,7 +41,10 @@ await build({
   bundle: true,
   platform: "node",
   format: "esm",
-  external: Object.keys(pkg.dependencies).filter((k) => k !== "@nazar/shared"),
+  external: [
+    ...Object.keys(pkg.dependencies).filter((k) => k !== "@nazar/shared"),
+    "ai",
+  ],
 });
 await build({
   entryPoints: ["apps/api/src/handler.ts"],
@@ -49,7 +52,10 @@ await build({
   bundle: true,
   platform: "node",
   format: "esm",
-  external: Object.keys(pkg.dependencies).filter((k) => k !== "@nazar/shared"),
+  external: [
+    ...Object.keys(pkg.dependencies).filter((k) => k !== "@nazar/shared"),
+    "ai",
+  ],
 });
 execFileSync(
   process.execPath,
@@ -59,7 +65,11 @@ execFileSync(
 await mkdir(extensionDir, { recursive: true });
 await mkdir("downloads", { recursive: true });
 await build({
-  entryPoints: ["apps/extension/src/worker.ts", "apps/extension/src/popup.ts"],
+  entryPoints: [
+    "apps/extension/src/worker.ts",
+    "apps/extension/src/popup.ts",
+    "apps/extension/src/bridge.ts",
+  ],
   outdir: extensionDir,
   bundle: true,
   format: "esm",
@@ -77,12 +87,27 @@ await writeFile(
     {
       manifest_version: 3,
       name: "Nazar — внимание по твоим правилам",
-      version: "0.3.1",
+      version: "0.4.0",
       minimum_chrome_version: "120",
       description: "Учебные сессии, бюджет сайтов и осознанные исключения.",
-      permissions: ["storage", "tabs", "idle", "alarms", "notifications"],
-      optional_permissions: ["history"],
-      host_permissions: [new URL(api).origin + "/*"],
+      permissions: [
+        "storage",
+        "tabs",
+        "history",
+        "idle",
+        "alarms",
+        "notifications",
+        "declarativeNetRequest",
+      ],
+      host_permissions: ["http://*/*", "https://*/*"],
+      externally_connectable: { matches: [new URL(web).origin + "/*"] },
+      content_scripts: [
+        {
+          matches: [new URL(web).origin + "/*"],
+          js: ["bridge.js"],
+          run_at: "document_start",
+        },
+      ],
       background: { service_worker: "worker.js", type: "module" },
       action: { default_popup: "popup.html", default_title: "Nazar" },
       icons: { 128: "icon.png" },

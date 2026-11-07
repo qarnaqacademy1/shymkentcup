@@ -1,5 +1,7 @@
 # Проверки Nazar 3.1 — 7 ноября 2026
 
+Обновление: локальная реализация **4.0** и актуальная матрица проверок описаны в [nazar4.md](nazar4.md). Ниже сохранён исторический отчёт 3.1; его результаты публикации не подтверждают публикацию 4.0.
+
 ## Production: опубликовано и проверено
 
 - Стабильный URL: https://nazar-orpin.vercel.app . Аккаунт CLI qarnaqacademy1-8878, scope qarnaq-academy1, отдельный проект nazar (prj_nzerPL4Tc8HdNiOzG0Bu8hmG5O0U). Deployment dpl_6p6YWsL4FTEEr9Xnffd6kRnX9Bzz: READY, production.

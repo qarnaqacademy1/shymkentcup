@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { unzipSync, strFromU8 } from "fflate";
-import { createActive, defaults, settle } from "@nazar/shared";
+import { createActive, defaults, settle, dayKey } from "@nazar/shared";
 
 const origin = process.env.NAZAR_PUBLIC_ORIGIN;
 assert.ok(
@@ -48,11 +48,20 @@ const zip = await call("/downloads/nazar-extension-production.zip");
 assert.equal(zip.status, 200);
 const files = unzipSync(new Uint8Array(await zip.arrayBuffer()));
 const manifest = JSON.parse(strFromU8(files["manifest.json"]));
-assert.deepEqual(manifest.host_permissions, [base + "/*"]);
+assert.deepEqual(manifest.host_permissions, ["http://*/*", "https://*/*"]);
+assert.ok(manifest.permissions.includes("declarativeNetRequest"));
+assert.ok(
+  manifest.permissions.includes("history") &&
+    manifest.permissions.includes("tabs"),
+);
+assert.deepEqual(manifest.externally_connectable.matches, [base + "/*"]);
+assert.equal(manifest.version, "0.4.0");
 assert.equal(manifest.manifest_version, 3);
 assert.ok(strFromU8(files["worker.js"]).includes(base));
 assert.match(strFromU8(files["worker.js"]), /credentials:\s*["']omit["']/);
-console.log("PASS public production ZIP and exact HTTPS host_permissions");
+console.log(
+  "PASS production ZIP: DNR permissions and exact trusted website origin",
+);
 const password = randomUUID() + randomUUID();
 const reg = await call("/api/auth/register", "POST", {
   email: `deploy-${randomUUID()}@example.test`,
@@ -114,8 +123,38 @@ try {
     200,
   );
   const now = Date.now() - 5000;
+  const planId = randomUUID();
+  const plan = {
+    id: planId,
+    goal: "Deployment verification (controlled timestamps)",
+    plannedMs: 1000,
+    source: "mobile",
+  };
+  assert.equal(
+    (await call("/api/plans", "POST", plan, { Cookie })).status,
+    201,
+  );
+  assert.equal(
+    (await call("/api/plans", "POST", plan, { Cookie })).status,
+    200,
+  );
+  const budget = await (
+    await call("/api/plans", "GET", undefined, { Cookie })
+  ).json();
+  assert.equal(budget.plannedMs, 1000);
+  assert.equal(
+    (
+      await call(
+        "/api/plans",
+        "POST",
+        { ...plan, id: randomUUID(), plannedMs: 14400000 },
+        { Cookie },
+      )
+    ).status,
+    409,
+  );
   const active = createActive(
-    randomUUID(),
+    planId,
     instanceId,
     "Deployment verification (controlled timestamps)",
     1000,
@@ -133,7 +172,40 @@ try {
   ).json();
   assert.equal(exported.sessions.length, 1);
   assert.equal(exported.sessions[0].source, "mobile");
+  assert.equal(exported.plans.length, 1);
   assert.ok(!JSON.stringify(exported).includes("passwordHash"));
+  const report = await (
+    await call(
+      "/api/reports/daily?day=" + dayKey(now, defaults.timezone),
+      "GET",
+      undefined,
+      { Cookie },
+    )
+  ).json();
+  assert.equal(report.reservedMs, 1000);
+  assert.equal(report.completed, 1);
+  assert.equal(report.trackedMs, 0);
+  const analytics = await (
+    await call(
+      `/api/analytics?from=${now - 1000}&to=${Date.now() + 1}`,
+      "GET",
+      undefined,
+      { Cookie },
+    )
+  ).json();
+  assert.equal(analytics.length, 1);
+  const assistant = await (
+    await call(
+      "/api/assistant",
+      "POST",
+      { goal: "Проверка публикации", useAI: false },
+      { Cookie },
+    )
+  ).json();
+  assert.equal(assistant.mode, "rules");
+  console.log(
+    "PASS Nazar 4 daily plans/cap/retry, report, analytics and labelled AI fallback",
+  );
   console.log(
     "PASS persistent auth, Secure cookie, CSRF/Origin, MV3 pairing/replay, Bearer, session retry/export",
   );

@@ -9,10 +9,13 @@ import {
   coach,
   defaults,
   decide,
+  dayKey,
   type Active,
   type Session,
 } from "@nazar/shared";
 import type { Settings } from "@nazar/shared";
+import { Donut } from "./nazar4";
+import { extensionRequest, type ExtensionState } from "./extensionBridge";
 const time = (ms: number) =>
   `${Math.floor(Math.max(0, ms) / 60000)
     .toString()
@@ -25,6 +28,8 @@ const labels: Record<string, string> = {
   allow5: "Разрешить на 5 минут",
   "allow-session": "Нужен до конца сессии",
   details: "Подробнее",
+  "focus-delay": "Осознанная пауза · 15 секунд",
+  "chat-pass": "Chat Pass · до 10 минут",
 };
 export function AttentionMap({
   session: s,
@@ -89,7 +94,10 @@ export function AttentionMap({
             {[
               ...s.warnings.map((w) => ({
                 at: w.at,
-                label: "Предупреждение бюджета",
+                label:
+                  w.kind === "site-limit"
+                    ? "Лимит сайта: " + w.domain
+                    : "Предупреждение бюджета",
               })),
               ...(s.decisions || []).map((d) => ({
                 at: d.at,
@@ -217,17 +225,26 @@ type StoredMobile = {
   ownerId: string;
   active: Active | null;
   queue: Session[];
+  pendingPlan?: { id: string; goal: string; plannedMs: number; day: string };
 };
 export function MobileTimer({
   ownerId,
   settings,
   upload,
   onSaved,
+  reserve,
+  getBudget,
 }: {
   ownerId: string;
   settings: Settings;
   upload: (s: Session) => Promise<void>;
   onSaved: () => void;
+  reserve: (plan: {
+    id: string;
+    goal: string;
+    plannedMs: number;
+  }) => Promise<{ remainingMs: number; plannedMs: number }>;
+  getBudget: () => Promise<{ remainingMs: number; plannedMs: number }>;
 }) {
   const key = "nazar-mobile-v1:" + ownerId;
   const [data, setData] = useState<StoredMobile>(() => {
@@ -245,6 +262,79 @@ export function MobileTimer({
     [minutes, setMinutes] = useState(25),
     [note, setNote] = useState(""),
     [done, setDone] = useState(false);
+  const [budget, setBudget] = useState<{
+    remainingMs: number;
+    plannedMs: number;
+  } | null>(null);
+  const [extension, setExtension] = useState<ExtensionState | null>(null),
+    [extensionMode, setExtensionMode] = useState(false),
+    [checkingExtension, setCheckingExtension] = useState(true),
+    [bridgeInfo, setBridgeInfo] = useState("");
+  useEffect(() => {
+    let live = true;
+    extensionRequest(ownerId, "state")
+      .then((s) => {
+        if (live) {
+          setExtension(s);
+          setExtensionMode(!data.active);
+          setBridgeInfo("Расширение подключено к этому аккаунту.");
+        }
+      })
+      .catch((e) => {
+        if (live) setBridgeInfo(e.message);
+      })
+      .finally(() => {
+        if (live) setCheckingExtension(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [ownerId]);
+  useEffect(() => {
+    if (!extensionMode || busy) return;
+    let live = true;
+    const id = setInterval(() => {
+      extensionRequest(ownerId, "state")
+        .then((s) => {
+          if (live) setExtension(s);
+        })
+        .catch((e) => {
+          if (live) setError(e.message);
+        });
+    }, 2000);
+    return () => {
+      live = false;
+      clearInterval(id);
+    };
+  }, [ownerId, extensionMode, busy]);
+  async function extensionAction(type: string, body: object = {}) {
+    setBusy(true);
+    setError("");
+    try {
+      setExtension(await extensionRequest(ownerId, type, body));
+      setBudget(await getBudget());
+      onSaved();
+      return true;
+    } catch (e: any) {
+      setError(e.message);
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+  useEffect(() => {
+    let live = true;
+    getBudget()
+      .then((b) => {
+        if (live) setBudget(b);
+      })
+      .catch((e) => {
+        if (live) setError(e.message);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 500);
     return () => clearInterval(id);
@@ -254,6 +344,15 @@ export function MobileTimer({
     setData(next);
   }
   function finish() {
+    if (extensionMode) {
+      void extensionAction("finish", { done, note }).then((saved) => {
+        if (saved) {
+          setDone(false);
+          setNote("");
+        }
+      });
+      return;
+    }
     if (!data.active) return;
     const a = structuredClone(data.active);
     settle(a, Date.now());
@@ -269,6 +368,7 @@ export function MobileTimer({
   }
   useEffect(() => {
     if (
+      !extensionMode &&
       data.active &&
       data.active.pausedAt === null &&
       now >= data.active.deadline
@@ -301,14 +401,38 @@ export function MobileTimer({
       setBusy(false);
     }
   }
-  const a = data.active;
+  const a = extensionMode ? extension?.active : data.active;
   return (
     <section className="mobile-timer">
-      <p className="eyebrow">МОБИЛЬНЫЙ ТАЙМЕР · САМООТМЕТКА</p>
-      <h1>Одна цель за раз.</h1>
+      <p className="eyebrow">NAZAR 4.0 · SMART START</p>
+      <h1>Сколько времени вы планируете сегодня заниматься?</h1>
       <p>
-        Этот режим не видит чужие вкладки и приложения. Для учёта сайтов
-        используйте Nazar в Chrome на компьютере.
+        {extensionMode
+          ? "Сессия работает в Chrome-расширении: оно учитывает активную вкладку и применяет правила сайтов, даже когда эта страница закрыта."
+          : "Самостоятельный таймер не видит чужие вкладки и приложения. Для измерений откройте сайт в Chrome с подключённым расширением Nazar."}
+      </p>
+      <p className="v4-status">
+        {checkingExtension ? "Проверяем расширение…" : bridgeInfo}
+      </p>
+      {extension && (
+        <label>
+          Режим сессии
+          <select
+            disabled={!!a || !!data.active || !!extension.active || busy}
+            value={extensionMode ? "extension" : "mobile"}
+            onChange={(e) => setExtensionMode(e.target.value === "extension")}
+          >
+            <option value="extension">Chrome · с учётом сайтов</option>
+            <option value="mobile">Самостоятельный таймер</option>
+          </select>
+        </label>
+      )}
+      <p className="smart-budget">
+        {budget
+          ? `Запланировано сегодня: ${time(budget.plannedMs)}. Осталось: ${time(budget.remainingMs)} из 4 часов.`
+          : "Проверяем суточный лимит…"}{" "}
+        День планирования: Asia/Qyzylorda. Для нового старта нужна связь с
+        сервером.
       </p>
       {a ? (
         <div className="panel">
@@ -316,11 +440,24 @@ export function MobileTimer({
           <div className="mobile-clock">
             {time(a.deadline - (a.pausedAt ?? now))}
           </div>
-          <p>{a.pausedAt ? "На паузе" : "До конца самостоятельной сессии"}</p>
+          <p>
+            {a.pausedAt
+              ? "На паузе"
+              : extensionMode
+                ? "До конца Chrome-сессии"
+                : "До конца самостоятельной сессии"}
+          </p>
           <div className="form-grid">
             <button
               className="secondary"
+              disabled={busy}
               onClick={() => {
+                if (extensionMode) {
+                  void extensionAction(
+                    a.pausedAt === null ? "pause" : "resume",
+                  );
+                  return;
+                }
                 const next = structuredClone(data);
                 if (next.active!.pausedAt === null)
                   pause(next.active!, Date.now());
@@ -330,7 +467,9 @@ export function MobileTimer({
             >
               {a.pausedAt ? "Продолжить" : "Пауза"}
             </button>
-            <button onClick={finish}>Завершить</button>
+            <button disabled={busy} onClick={finish}>
+              Завершить
+            </button>
           </div>
           <label>
             <input
@@ -352,21 +491,79 @@ export function MobileTimer({
       ) : (
         <form
           className="panel"
-          onSubmit={(e) => {
+          onSubmit={async (e) => {
             e.preventDefault();
-            if (!goal.trim()) return;
-            const active = createActive(
-              crypto.randomUUID(),
-              crypto.randomUUID(),
-              goal.trim(),
-              minutes * 60000,
-              settings,
-              Date.now(),
-            );
-            active.session.source = "mobile";
-            save({ ...data, active });
+            if (!goal.trim() || busy) return;
+            setBusy(true);
+            setError("");
+            try {
+              if (
+                !Number.isFinite(minutes) ||
+                minutes < 1 / 60 ||
+                minutes > 240
+              )
+                throw Error("Выберите от 1 секунды до 240 минут");
+              const plannedMs = Math.round(minutes * 60000);
+              if (extensionMode) {
+                setExtension(
+                  await extensionRequest(ownerId, "start", {
+                    goal: goal.trim(),
+                    minutes,
+                  }),
+                );
+                setBudget(await getBudget());
+                return;
+              }
+              const pending = data.pendingPlan;
+              const day = dayKey(Date.now(), "Asia/Qyzylorda");
+              const plan =
+                pending?.goal === goal.trim() &&
+                pending.plannedMs === plannedMs &&
+                pending.day === day
+                  ? pending
+                  : {
+                      id: crypto.randomUUID(),
+                      goal: goal.trim(),
+                      plannedMs,
+                      day,
+                    };
+              save({ ...data, pendingPlan: plan });
+              const b = await reserve(plan);
+              setBudget(b);
+              const active = createActive(
+                plan.id,
+                crypto.randomUUID(),
+                goal.trim(),
+                plannedMs,
+                settings,
+                Date.now(),
+              );
+              active.session.source = "mobile";
+              save({ ...data, pendingPlan: undefined, active });
+            } catch (e: any) {
+              setError(e.message);
+            } finally {
+              setBusy(false);
+            }
           }}
         >
+          <div
+            className="smart-presets"
+            role="group"
+            aria-label="Выбрать длительность"
+          >
+            {[5, 15, 30, 60, 120].map((m) => (
+              <button
+                key={m}
+                type="button"
+                className="secondary"
+                aria-pressed={minutes === m}
+                onClick={() => setMinutes(m)}
+              >
+                {m} мин
+              </button>
+            ))}
+          </div>
           <label>
             Шаблон
             <select
@@ -406,14 +603,35 @@ export function MobileTimer({
             />
           </label>
           <p className="muted">
-            Правила сайтов для таймера не применяются. На компьютере подтвердите
-            список и бюджет перед стартом.
+            {extensionMode
+              ? `Правила аккаунта применятся после синхронизации. Общий бюджет: ${time(settings.budgetMs)}.`
+              : "Правила сайтов для самостоятельного таймера не применяются."}
           </p>
-          <button>Начать самостоятельную сессию →</button>
+          <button disabled={busy || checkingExtension}>
+            {busy
+              ? "Проверяем план…"
+              : extensionMode
+                ? "Начать Chrome-сессию →"
+                : "Начать самостоятельную сессию →"}
+          </button>
         </form>
       )}
       <div className="panel">
         <h3>Синхронизация</h3>
+        {extensionMode && (
+          <>
+            <p>
+              Chrome: {extension?.syncStatus}. В очереди:{" "}
+              {extension?.queueCount ?? 0}.
+            </p>
+            <button
+              disabled={busy}
+              onClick={() => void extensionAction("sync")}
+            >
+              Синхронизировать расширение
+            </button>
+          </>
+        )}
         <p>
           {data.queue.length
             ? `Сохранено на устройстве: ${data.queue.length}`
@@ -548,6 +766,10 @@ export function DemoMap() {
         статистику.
       </p>
       <AttentionMap session={a.session} demo />
+      <section className="panel">
+        <h2>Donut Analytics · контрольный пример</h2>
+        <Donut intervals={a.session.intervals} settings={a.session.rules} />
+      </section>
       <a className="button secondary" href="#overview">
         Вернуться в Nazar
       </a>
