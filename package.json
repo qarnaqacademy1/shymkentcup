@@ -1,0 +1,62 @@
+{
+  "name": "nazar",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n api,web \"npm run dev -w @nazar/api\" \"npm run dev -w @nazar/web\"",
+    "db:generate": "node scripts/generate-db.mjs",
+    "db:migrate": "node scripts/migrate.mjs",
+    "build": "npm run db:generate && node scripts/build.mjs",
+    "start": "node --env-file-if-exists=.env apps/api/dist/server.js",
+    "test": "tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "verify:clean": "node scripts/reproduce.mjs",
+    "verify:built": "node scripts/smoke-built.mjs",
+    "db:backup": "node scripts/backup-db.mjs",
+    "db:migrate:production": "node scripts/migrate-postgres.mjs",
+    "build:vercel": "npm run db:generate && node scripts/build.mjs --production",
+    "build:production": "npm run build:vercel",
+    "verify:postgres": "node scripts/verify-postgres.mjs"
+  },
+  "dependencies": {
+    "@libsql/client": "0.17.4",
+    "@nazar/shared": "*",
+    "@node-rs/argon2": "2.2.2",
+    "@prisma/adapter-libsql": "7.10.1",
+    "@prisma/adapter-pg": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "cookie-parser": "1.4.7",
+    "dotenv": "17.2.3",
+    "express": "5.2.1",
+    "express-rate-limit": "8.7.3",
+    "helmet": "8.1.0",
+    "pg": "8.23.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.1.32",
+    "@types/cookie-parser": "1.4.10",
+    "@types/express": "5.0.6",
+    "@types/node": "24.10.0",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "concurrently": "9.2.5",
+    "esbuild": "0.28.2",
+    "fflate": "0.8.3",
+    "prettier": "3.6.2",
+    "prisma": "7.10.1",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vite": "8.3.6"
+  }
+}

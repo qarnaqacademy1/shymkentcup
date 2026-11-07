@@ -1,0 +1,54 @@
+generator client {
+  provider = "prisma-client"
+  output = "../generated-pg/prisma"
+}
+datasource db {
+  provider = "postgresql"
+}
+model User {
+  id String @id @default(uuid())
+  email String @unique
+  passwordHash String
+  createdAt DateTime @default(now())
+  settings String
+  history String?
+  credentials Credential[]
+  codes PairCode[]
+  sessions StudySession[]
+}
+model Credential {
+  id String @id @default(uuid())
+  userId String
+  user User @relation(fields:[userId], references:[id], onDelete:Cascade)
+  hash String @unique
+  kind String
+  instanceId String?
+  name String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+model PairCode {
+  hash String @id
+  userId String
+  user User @relation(fields:[userId], references:[id], onDelete:Cascade)
+  expiresAt DateTime
+}
+model StudySession {
+  id String @id @default(uuid())
+  userId String
+  user User @relation(fields:[userId], references:[id], onDelete:Cascade)
+  clientSessionId String
+  instanceId String
+  startedAt DateTime
+  endedAt DateTime
+  payload String
+  payloadHash String
+  createdAt DateTime @default(now())
+  @@unique([userId, clientSessionId])
+  @@index([userId, startedAt])
+}
+model RateLimit {
+  key String @id
+  total Int
+  expiresAt DateTime
+}

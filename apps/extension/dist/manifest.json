@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Nazar — внимание по твоим правилам",
+  "version": "0.3.1",
+  "minimum_chrome_version": "120",
+  "description": "Учебные сессии, бюджет сайтов и осознанные исключения.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "idle",
+    "alarms",
+    "notifications"
+  ],
+  "optional_permissions": [
+    "history"
+  ],
+  "host_permissions": [
+    "http://localhost:3001/*"
+  ],
+  "background": {
+    "service_worker": "worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Nazar"
+  },
+  "icons": {
+    "128": "icon.png"
+  }
+}

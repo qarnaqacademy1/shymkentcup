@@ -1,0 +1,5 @@
+{
+  "name": "@nazar/extension",
+  "private": true,
+  "type": "module"
+}

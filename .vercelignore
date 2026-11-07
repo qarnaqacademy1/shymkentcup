@@ -1,0 +1,12 @@
+.git
+.env*
+!.env.example
+data
+artifacts
+node_modules
+docs/screenshots
+apps/extension/dist
+apps/extension/dist-production
+apps/api/generated
+apps/api/generated-pg
+downloads
